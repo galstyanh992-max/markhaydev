@@ -1,0 +1,530 @@
+"use client";
+
+import { useEffect, useMemo, useState, useCallback } from "react";
+import { motion } from "framer-motion";
+import { useApp } from "@/lib/store";
+import { useI18n, api } from "@/lib/use-i18n";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Progress } from "@/components/ui/progress";
+import { Badge } from "@/components/ui/badge";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Building2, Flame, CalendarRange, FileStack, ImageIcon, Clapperboard,
+  AudioLines, Mic, UserSquare, Send, TrendingUp, Zap, Clock, Wallet,
+  ExternalLink, Activity, Globe, ShieldCheck,
+} from "lucide-react";
+
+interface Job {
+  id: string;
+  kind: string;
+  status: string;
+  stage?: string | null;
+  error?: string | null;
+  createdAt: string;
+}
+interface EvidenceQuote { quote: string; source: string; observedAt: string }
+interface Trend {
+  id: string;
+  title: string;
+  platform?: string | null;
+  status: string;
+  brandFitScore?: number | null;
+  confidence?: number | null;
+  sourceName?: string | null;
+  sourceUrl?: string | null;
+  metricsObserved?: string | null;
+  evidence?: EvidenceQuote[] | null;
+}
+interface Scheduled {
+  id: string;
+  platform: string;
+  scheduledAt: string;
+  status: string;
+  contentItem?: { title: string } | null;
+}
+interface Costs {
+  today: number;
+  week: number;
+  month: number;
+  daily14?: { date: string; cost: number }[];
+  byProvider: { provider: string; cost: number }[];
+}
+interface DashData {
+  jobs: Job[];
+  trends: Trend[];
+  allTrends: Trend[];
+  scheduled: Scheduled[];
+  costs: Costs;
+  contentCount: number;
+  brandCount: number;
+}
+// aggregated external source backing the user's trend signals (durable — unlike the transient search panel in Trends)
+interface SourceAgg {
+  host: string;
+  url: string;
+  name: string;
+  signals: number;
+  verified: number;
+  sampleTitle: string;
+}
+
+const QUICK = [
+  { view: "brands" as const, icon: Building2, key: "dash.qa.analyze", neon: "--neon" },
+  { view: "trends" as const, icon: Flame, key: "dash.qa.trends", neon: "--neon-3" },
+  { view: "planner" as const, icon: CalendarRange, key: "dash.qa.strategy", neon: "--neon" },
+  { view: "content" as const, icon: FileStack, key: "dash.qa.content", neon: "--neon-2" },
+  { view: "image" as const, icon: ImageIcon, key: "dash.qa.image", neon: "--neon" },
+  { view: "video" as const, icon: Clapperboard, key: "dash.qa.video", neon: "--neon-3" },
+  { view: "voice" as const, icon: AudioLines, key: "dash.qa.music", neon: "--neon-2" },
+  { view: "voice" as const, icon: Mic, key: "dash.qa.voice", neon: "--neon" },
+  { view: "voice" as const, icon: UserSquare, key: "dash.qa.avatar", neon: "--neon-3" },
+  { view: "publishing" as const, icon: Send, key: "dash.qa.schedule", neon: "--neon-2" },
+];
+
+// sparkline bar class by spend level (zero → faint, spend → neon gradient)
+function cnSpark(cost: number): string {
+  if (cost <= 0) return "min-h-[2px] flex-1 rounded-t-sm bg-muted/50";
+  if (cost < 0.05) return "min-h-[2px] flex-1 rounded-t-sm bg-[var(--neon)]/45";
+  if (cost < 0.2) return "min-h-[2px] flex-1 rounded-t-sm bg-[var(--neon)] shadow-[0_0_6px_var(--neon)]";
+  return "min-h-[2px] flex-1 rounded-t-sm bg-gradient-to-t from-[var(--neon-3)] to-[var(--neon)] shadow-[0_0_8px_var(--neon)]";
+}
+
+// honest trend status → badge style (verified = confirmed by live source, hypothesis = LLM guess)
+function trendAccent(status: string): { className?: string; style?: React.CSSProperties } {
+  switch (status) {
+    case "VERIFIED_TREND":
+      return { className: "", style: { background: "color-mix(in oklab, var(--neon-2) 16%, transparent)", color: "var(--neon-2)", borderColor: "color-mix(in oklab, var(--neon-2) 40%, transparent)" } };
+    case "EMERGING_SIGNAL":
+      return { className: "", style: { background: "color-mix(in oklab, var(--neon) 14%, transparent)", color: "var(--neon)", borderColor: "color-mix(in oklab, var(--neon) 40%, transparent)" } };
+    case "HYPOTHESIS":
+      return { className: "bg-amber-500/10 text-amber-500 border-amber-500/30" };
+    default:
+      return { className: "bg-muted/40 text-muted-foreground border-border" };
+  }
+}
+
+function hostOf(url: string | null | undefined): string {
+  if (!url) return "";
+  try { return new URL(url).host; } catch { return ""; }
+}
+
+export function DashboardModule() {
+  const { t, locale } = useI18n();
+  const setView = useApp((s) => s.setView);
+  const user = useApp((s) => s.user);
+  const activeBrandId = useApp((s) => s.activeBrandId);
+  const brands = useApp((s) => s.activeBrandId);
+  const [data, setData] = useState<DashData | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(async () => {
+    try {
+      const [jobs, trends, scheduled, costs, content, brandsList] = await Promise.all([
+        api<Job[]>("/api/jobs?limit=12"),
+        api<Trend[]>("/api/trends"), // user-level signals (brand-agnostic): ranking surfaces the most relevant
+        api<Scheduled[]>("/api/schedule?upcoming=1"),
+        api<Costs>("/api/costs"),
+        api<unknown[]>(`/api/content${activeBrandId ? `?brandId=${activeBrandId}` : ""}`),
+        api<{ id: string }[]>("/api/brands"),
+      ]);
+      // surface the most valuable trends first: live-verified > emerging > popular > hypothesis
+      const order: Record<string, number> = { VERIFIED_TREND: 0, EMERGING_SIGNAL: 1, POPULAR_TOPIC: 2, HYPOTHESIS: 3 };
+      const ranked = [...trends].sort((a, b) => {
+        const d = (order[a.status] ?? 4) - (order[b.status] ?? 4);
+        return d !== 0 ? d : (b.confidence ?? 0) - (a.confidence ?? 0);
+      });
+      setData({ jobs, trends: ranked.slice(0, 5), allTrends: ranked, scheduled, costs, contentCount: content.length, brandCount: brandsList.length });
+    } catch {
+      // dashboard stays usable; empty states show
+    } finally {
+      setLoading(false);
+    }
+  }, [activeBrandId]);
+
+  useEffect(() => {
+    load();
+    const iv = setInterval(load, 10000); // job feed auto-refresh
+    return () => clearInterval(iv);
+  }, [load]);
+
+  const activeJobs = data?.jobs.filter((j) => ["QUEUED", "PROCESSING", "WAITING_PROVIDER", "RETRYING"].includes(j.status)) ?? [];
+
+  // ---- "My week" strip: bucket upcoming scheduled posts into the next 7 local days ----
+  const weekDays = useMemo(() => {
+    const fmtDay = new Intl.DateTimeFormat(locale, { weekday: "short" });
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    return Array.from({ length: 7 }, (_, i) => {
+      const d = new Date(start);
+      d.setDate(d.getDate() + i);
+      const next = new Date(d);
+      next.setDate(next.getDate() + 1);
+      const posts = (data?.scheduled ?? []).filter((p) => {
+        const at = new Date(p.scheduledAt);
+        return at >= d && at < next;
+      });
+      return { date: d, label: fmtDay.format(d), posts, isToday: i === 0 };
+    });
+  }, [data?.scheduled, locale]);
+  const weekHasPosts = weekDays.some((d) => d.posts.length > 0);
+
+  // aggregate the external sources behind ALL trend signals (not just top-5): group by host, count support
+  const sources = useMemo<SourceAgg[]>(() => {
+    const map = new Map<string, SourceAgg>();
+    for (const tr of data?.allTrends ?? []) {
+      const host = hostOf(tr.sourceUrl);
+      if (!host) continue; // hypotheses have no live source — honest widget only lists verifiable ones
+      const key = host.replace(/^www\./, "");
+      const prev = map.get(key);
+      if (prev) {
+        prev.signals += 1;
+        if (tr.status === "VERIFIED_TREND") prev.verified += 1;
+      } else {
+        map.set(key, {
+          host: key,
+          url: tr.sourceUrl ?? "#",
+          name: tr.sourceName ?? key,
+          signals: 1,
+          verified: tr.status === "VERIFIED_TREND" ? 1 : 0,
+          sampleTitle: tr.title,
+        });
+      }
+    }
+    return [...map.values()].sort((a, b) => b.verified - a.verified || b.signals - a.signals).slice(0, 6);
+  }, [data?.allTrends]);
+  const signalsWithSource = useMemo(
+    () => (data?.allTrends ?? []).filter((tr) => !!hostOf(tr.sourceUrl)).length,
+    [data?.allTrends]
+  );
+
+  // time-aware greeting (client-side — safe because this module renders after auth only)
+  const greeting = useMemo(() => {
+    const h = new Date().getHours();
+    if (h < 12) return t("dash.greet.morning");
+    if (h < 18) return t("dash.greet.afternoon");
+    return t("dash.greet.evening");
+  }, [t]);
+
+  return (
+    <div className="grid gap-5">
+      {/* welcome */}
+      <motion.section initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} className="glass-strong neon-border rounded-2xl p-5 sm:p-6">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h1 className="text-xl font-semibold sm:text-2xl">
+              {greeting}, <span className="neon-text">{user?.name ?? user?.email}</span>
+            </h1>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {data && data.brandCount === 0 ? t("dash.noBrand") : `${data?.brandCount ?? 0} brands · ${data?.contentCount ?? 0} content items`}
+            </p>
+          </div>
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <Zap className="h-3.5 w-3.5 text-[var(--neon)]" /> Cloud AI Core connected
+          </div>
+        </div>
+      </motion.section>
+
+      {/* quick actions */}
+      <section aria-label={t("dash.quickActions")}>
+        <h2 className="heading-accent mb-3 text-sm font-medium tracking-wide text-muted-foreground">{t("dash.quickActions")}</h2>
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+          {QUICK.map(({ view, icon: Icon, key, neon }, i) => (
+            <motion.button
+              key={key + i}
+              initial={{ opacity: 0, scale: 0.96 }}
+              animate={{ opacity: 1, scale: 1 }}
+              transition={{ delay: i * 0.03 }}
+              onClick={() => setView(view)}
+              className="glass glass-hover group flex flex-col items-start gap-3 rounded-xl p-4 text-left"
+            >
+              <span className="rounded-lg p-2 transition group-hover:scale-110" style={{ background: `color-mix(in oklab, var(${neon}) 18%, transparent)` }}>
+                <Icon className="h-5 w-5" style={{ color: `var(${neon})` }} />
+              </span>
+              <span className="text-xs font-medium leading-snug sm:text-sm">{t(key)}</span>
+            </motion.button>
+          ))}
+        </div>
+      </section>
+
+      {/* my week — 7-day publishing strip */}
+      <section aria-label={t("dash.week")}>
+        <h2 className="heading-accent mb-3 text-sm font-medium tracking-wide text-muted-foreground">{t("dash.week")}</h2>
+        <Card className="glass rounded-2xl">
+          <CardContent className="p-4">
+            {!data ? (
+              <Skeleton className="h-20 rounded-xl bg-muted/40 shimmer" />
+            ) : !weekHasPosts ? (
+              <p className="py-4 text-center text-sm text-muted-foreground">{t("dash.weekEmpty")}</p>
+            ) : (
+              <div className="grid grid-cols-7 gap-1.5 sm:gap-2">
+                {weekDays.map((d) => (
+                  <button
+                    key={d.date.toISOString()}
+                    onClick={() => setView("publishing")}
+                    className={`focus-glow group flex min-h-20 flex-col items-center gap-1.5 rounded-xl border px-1 py-2 transition-all hover:-translate-y-0.5 ${
+                      d.isToday
+                        ? "border-[var(--neon)]/50 bg-[var(--neon)]/10 neon-border"
+                        : "border-border/60 bg-muted/20 hover:border-[var(--neon)]/40"
+                    }`}
+                    aria-label={`${d.label}, ${d.posts.length} posts`}
+                  >
+                    <span className={`text-[10px] font-semibold uppercase tracking-wide ${d.isToday ? "text-[var(--neon)]" : "text-muted-foreground"}`}>
+                      {d.label}
+                    </span>
+                    <span className="text-sm font-medium tabular-nums">{d.date.getDate()}</span>
+                    <span className="flex flex-wrap items-center justify-center gap-0.5">
+                      {d.posts.slice(0, 3).map((p) => (
+                        <span
+                          key={p.id}
+                          title={p.contentItem?.title ?? p.platform}
+                          className="h-1.5 w-1.5 rounded-full"
+                          style={{
+                            background: p.status === "PUBLISHED" ? "var(--neon-2)" : "var(--neon)",
+                            boxShadow: `0 0 6px ${p.status === "PUBLISHED" ? "var(--neon-2)" : "var(--neon)"}`,
+                          }}
+                        />
+                      ))}
+                      {d.posts.length > 3 && <span className="text-[9px] font-medium text-muted-foreground">+{d.posts.length - 3}</span>}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </section>
+
+      <div className="grid gap-5 lg:grid-cols-3">
+        {/* active jobs */}
+        <Card className="glass rounded-2xl lg:col-span-2">
+          <CardHeader className="pb-2">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Clock className="h-4 w-4 text-[var(--neon)]" /> {t("dash.activeJobs")}
+              {activeJobs.length > 0 && <Badge variant="secondary" className="animate-pulse-soft">{activeJobs.length}</Badge>}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="max-h-64 overflow-y-auto scrollbar-thin">
+            {loading ? (
+              <div className="grid gap-2">{[...Array(3)].map((_, i) => <Skeleton key={i} className="h-12 rounded-xl bg-muted/40 shimmer" />)}</div>
+            ) : activeJobs.length === 0 ? (
+              <p className="py-6 text-center text-sm text-muted-foreground">{t("dash.noJobs")}</p>
+            ) : (
+              <ul className="grid grid-cols-[minmax(0,1fr)] gap-2">
+                {activeJobs.map((j) => (
+                  <li key={j.id} className="flex items-center justify-between gap-3 rounded-xl border border-border/60 bg-muted/20 px-3 py-2.5">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium">{j.kind}</p>
+                      <p className="text-xs text-muted-foreground">{new Date(j.createdAt).toLocaleTimeString()}</p>
+                    </div>
+                    <Badge variant={j.status === "RETRYING" ? "destructive" : "secondary"} className="shrink-0 text-[10px]">
+                      {t(`job.status.${j.status}` as const)}
+                    </Badge>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* budget */}
+        <Card className="glass rounded-2xl">
+          <CardHeader className="pb-2">
+            <CardTitle className="flex items-center gap-2 text-base"><Wallet className="h-4 w-4 text-[var(--neon-2)]" /> {t("dash.budget")}</CardTitle>
+          </CardHeader>
+          <CardContent className="grid gap-3">
+            {data ? (
+              <>
+                <div>
+                  <div className="mb-1 flex justify-between text-xs">
+                    <span className="text-muted-foreground">Today</span>
+                    <span className="font-medium">${data.costs.today.toFixed(3)}</span>
+                  </div>
+                  <Progress value={Math.min(100, data.costs.today * 20)} className="h-1.5" />
+                </div>
+                <div>
+                  <div className="mb-1 flex justify-between text-xs">
+                    <span className="text-muted-foreground">Week</span>
+                    <span className="font-medium">${data.costs.week.toFixed(3)}</span>
+                  </div>
+                  <Progress value={Math.min(100, data.costs.week * 4)} className="h-1.5" />
+                </div>
+                <div>
+                  <div className="mb-1 flex justify-between text-xs">
+                    <span className="text-muted-foreground">Month</span>
+                    <span className="font-medium">${data.costs.month.toFixed(3)}</span>
+                  </div>
+                  <Progress value={Math.min(100, data.costs.month)} className="h-1.5" />
+                </div>
+                {data.costs.daily14 && data.costs.daily14.some((d) => d.cost > 0) && (
+                  <div className="mt-1" role="img" aria-label={t("dash.costTrend")}>
+                    <div className="mb-1.5 flex items-center justify-between text-[11px] text-muted-foreground">
+                      <span>{t("dash.costTrend")}</span>
+                      <span className="font-mono">14d</span>
+                    </div>
+                    <div className="flex h-12 items-end gap-[3px]">
+                      {(() => {
+                        const series = data.costs.daily14 ?? [];
+                        const max = Math.max(...series.map((d) => d.cost), 0.0001);
+                        return series.map((d, i) => (
+                          <motion.span
+                            key={d.date}
+                            title={`${d.date}: $${d.cost.toFixed(3)}`}
+                            initial={{ height: 2, opacity: 0 }}
+                            animate={{ height: `${Math.max(6, (d.cost / max) * 100)}%`, opacity: 1 }}
+                            transition={{ delay: i * 0.03, duration: 0.4, ease: "easeOut" }}
+                            className={cnSpark(d.cost)}
+                          />
+                        ));
+                      })()}
+                    </div>
+                  </div>
+                )}
+                <p className="text-[11px] text-muted-foreground">
+                  Hard limits enforced by Autopilot policy · {data.costs.byProvider.length} providers tracked
+                </p>
+              </>
+            ) : (
+              <Skeleton className="h-32 rounded-xl bg-muted/40 shimmer" />
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid gap-5 lg:grid-cols-2">
+        {/* trends */}
+        <Card className="glass rounded-2xl">
+          <CardHeader className="pb-2">
+            <CardTitle className="flex items-center gap-2 text-base"><TrendingUp className="h-4 w-4 text-[var(--neon-3)]" /> {t("dash.trendOpportunities")}</CardTitle>
+          </CardHeader>
+          <CardContent className="max-h-60 overflow-y-auto scrollbar-thin">
+            {!data || data.trends.length === 0 ? (
+              <p className="py-6 text-center text-sm text-muted-foreground">{t("dash.noTrends")}</p>
+            ) : (
+              <ul className="grid grid-cols-[minmax(0,1fr)] gap-2">
+                {data.trends.map((tr) => {
+                  const a = trendAccent(tr.status);
+                  const ev = tr.evidence?.[0];
+                  const host = hostOf(tr.sourceUrl);
+                  return (
+                    <li key={tr.id} className="rounded-xl border border-border/60 bg-muted/20 px-3 py-2.5 transition hover:border-[var(--neon)]/30">
+                      <div className="flex items-start justify-between gap-2">
+                        <p className="line-clamp-1 text-sm font-medium">{tr.title}</p>
+                        <Badge variant="outline" className={`shrink-0 text-[10px] ${a.className ?? ""}`} style={a.style}>
+                          {t(`trends.status.${tr.status}` as const)}
+                        </Badge>
+                      </div>
+                      {tr.brandFitScore != null && (
+                        <p className="mt-1 text-[11px] text-muted-foreground">Brand fit: {(tr.brandFitScore * 100).toFixed(0)}% · {tr.platform ?? "web"}</p>
+                      )}
+                      {ev && (
+                        <p className="quote-accent mt-2 line-clamp-2 text-[11px] italic text-muted-foreground" title={ev.source}>
+                          “{ev.quote}”
+                        </p>
+                      )}
+                      <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground">
+                        {tr.metricsObserved && (
+                          <span className="inline-flex items-center gap-1 text-[var(--neon-3)]" title={tr.metricsObserved}>
+                            <Activity className="h-3 w-3" aria-hidden /> {tr.metricsObserved.slice(0, 60)}
+                          </span>
+                        )}
+                        {host && (
+                          <a
+                            href={tr.sourceUrl ?? "#"}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="ml-auto inline-flex items-center gap-1 opacity-70 transition hover:opacity-100 hover:text-[var(--neon)]"
+                          >
+                            <ExternalLink className="h-3 w-3" aria-hidden /> {host}
+                          </a>
+                        )}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* next posts */}
+        <Card className="glass rounded-2xl">
+          <CardHeader className="pb-2">
+            <CardTitle className="flex items-center gap-2 text-base"><Send className="h-4 w-4 text-[var(--neon-2)]" /> {t("dash.nextPosts")}</CardTitle>
+          </CardHeader>
+          <CardContent className="max-h-60 overflow-y-auto scrollbar-thin">
+            {!data || data.scheduled.length === 0 ? (
+              <p className="py-6 text-center text-sm text-muted-foreground">{t("dash.noPosts")}</p>
+            ) : (
+              <ul className="grid grid-cols-[minmax(0,1fr)] gap-2">
+                {data.scheduled.map((p) => (
+                  <li key={p.id} className="flex items-center justify-between gap-3 rounded-xl border border-border/60 bg-muted/20 px-3 py-2.5">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium">{p.contentItem?.title ?? p.platform}</p>
+                      <p className="text-xs text-muted-foreground">{new Date(p.scheduledAt).toLocaleString()}</p>
+                    </div>
+                    <Badge variant="outline" className="shrink-0 text-[10px]">{p.platform}</Badge>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* signal sources — durable aggregation of the external evidence behind all trend signals */}
+      <section aria-label={t("dash.sources")} data-tour="sources">
+        <h2 className="heading-accent mb-3 text-sm font-medium tracking-wide text-muted-foreground">
+          {t("dash.sources")} · {signalsWithSource}/{data?.allTrends.length ?? 0}
+        </h2>
+        <Card className="glass rounded-2xl">
+          <CardContent className="p-4">
+            {!data ? (
+              <div className="flex flex-wrap gap-2">{[...Array(3)].map((_, i) => <Skeleton key={i} className="h-16 w-44 rounded-xl bg-muted/40 shimmer" />)}</div>
+            ) : sources.length === 0 ? (
+              <div className="flex flex-col items-center gap-2 py-4">
+                <Globe className="h-6 w-6 text-muted-foreground/50" aria-hidden />
+                <p className="text-center text-sm text-muted-foreground">{t("dash.sourcesEmpty")}</p>
+                <button onClick={() => setView("trends")} className="focus-glow rounded-lg px-3 py-1.5 text-xs font-medium text-[var(--neon)] transition hover:bg-[var(--neon)]/10">
+                  {t("dash.sourcesCta")}
+                </button>
+              </div>
+            ) : (
+              <>
+                <div className="flex flex-wrap gap-2.5">
+                  {sources.map((s, i) => (
+                    <motion.a
+                      key={s.host}
+                      href={s.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title={`${s.name} — ${s.sampleTitle}`}
+                      initial={{ opacity: 0, y: 8 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ delay: i * 0.05 }}
+                      className="source-card group flex min-w-40 flex-1 flex-col gap-1.5 rounded-xl p-3 sm:min-w-48"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="rank-chip">{String(i + 1).padStart(2, "0")}</span>
+                        <span className="truncate text-xs font-semibold">{s.host}</span>
+                        <ExternalLink className="ml-auto h-3 w-3 shrink-0 text-muted-foreground opacity-0 transition group-hover:opacity-100" aria-hidden />
+                      </div>
+                      <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                        <span>{t("dash.sourceSignals", { n: s.signals })}</span>
+                        {s.verified > 0 && (
+                          <span className="inline-flex items-center gap-0.5 text-[var(--neon-2)]" title={t("trends.status.VERIFIED_TREND")}>
+                            <ShieldCheck className="h-3 w-3" aria-hidden /> {s.verified}
+                          </span>
+                        )}
+                      </div>
+                    </motion.a>
+                  ))}
+                </div>
+                <p className="mt-3 text-[11px] leading-relaxed text-muted-foreground">{t("dash.sourcesNote")}</p>
+              </>
+            )}
+          </CardContent>
+        </Card>
+      </section>
+    </div>
+  );
+}
